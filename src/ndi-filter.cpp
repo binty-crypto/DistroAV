@@ -121,6 +121,13 @@ typedef struct {
 	// Keep the parent source active while this filter is attached, so media and
 	// slideshows play and the output is valid without the scene being in Program,
 	// Preview or a Multiview.
+	// Off-screen render: when nothing else draws the parent this frame (not in
+	// Program/Preview/Multiview/projector) we draw it ourselves from a main render
+	// callback so the capture still happens. Only used while keep_active is on.
+	gs_texrender_t *offscreen;
+	bool offscreen_pass; // true while our own off-screen draw is in progress
+	bool offscreen_registered;
+
 	bool keep_active;          // setting
 	bool holding_active;       // we currently hold an active ref on the parent
 	obs_source_t *held_parent; // the parent we took the ref on
@@ -565,10 +572,59 @@ static void ndi_filter_readback_async(ndi_filter_t *f, gs_texture_t *tex, uint64
 	f->worker->cv.notify_one();
 }
 
+// Runs every frame on the graphics thread, before OBS draws Program. If the
+// parent has not been rendered yet this frame (so nothing on screen shows it)
+// and Keep scene active is on, render it into a scratch target; that runs the
+// filter chain, which brings us into ndi_filter_render_video for the capture.
+static void ndi_filter_offscreen_render(void *data, uint32_t, uint32_t)
+{
+	auto f = (ndi_filter_t *)data;
+	if (f->rendered || !f->keep_active || !f->holding_active)
+		return;
+	obs_source_t *parent = obs_filter_get_parent(f->obs_source);
+	if (!parent || !obs_source_enabled(f->obs_source))
+		return;
+
+	// Respect the frame rate limit without touching its state: if the next
+	// frame is not due, there is nothing to draw.
+	if (f->effective_fps > 0 && f->next_frame_ns != 0) {
+		const uint64_t interval = 1000000000ULL / f->effective_fps;
+		if (os_gettime_ns() + interval / 4 < f->next_frame_ns) {
+			f->rendered = true; // nothing else should capture this frame either
+			return;
+		}
+	}
+
+	uint32_t width = obs_source_get_width(parent);
+	uint32_t height = obs_source_get_height(parent);
+	if (!width || !height)
+		return;
+
+	if (!f->offscreen)
+		f->offscreen = gs_texrender_create(TEXFORMAT, GS_ZS_NONE);
+	gs_texrender_reset(f->offscreen);
+	if (!gs_texrender_begin(f->offscreen, width, height))
+		return;
+
+	vec4 background;
+	vec4_zero(&background);
+	gs_clear(GS_CLEAR_COLOR, &background, 0.0f, 0);
+	gs_ortho(0.0f, (float)width, 0.0f, (float)height, -100.0f, 100.0f);
+
+	f->offscreen_pass = true;
+	obs_source_video_render(parent); // runs the filter chain -> ndi_filter_render_video
+	f->offscreen_pass = false;
+
+	gs_texrender_end(f->offscreen);
+}
+
 void ndi_filter_render_video(void *data, gs_effect_t *)
 {
 	auto f = (ndi_filter_t *)data;
-	obs_source_skip_video_filter(f->obs_source);
+	// Normal path: pass the image through to whatever is drawing the scene.
+	// Off-screen path: nothing is watching, so skip that draw.
+	if (!f->offscreen_pass)
+		obs_source_skip_video_filter(f->obs_source);
 
 	if (f->rendered)
 		return;
@@ -868,6 +924,8 @@ void *ndi_filter_create(obs_data_t *settings, obs_source_t *obs_source)
 	auto f = (ndi_filter_t *)bzalloc(sizeof(ndi_filter_t));
 	f->obs_source = obs_source;
 	f->texrender = gs_texrender_create(TEXFORMAT, GS_ZS_NONE);
+	obs_add_main_render_callback(ndi_filter_offscreen_render, f);
+	f->offscreen_registered = true;
 	pthread_mutex_init(&f->ndi_sender_video_mutex, NULL);
 	pthread_mutex_init(&f->ndi_sender_audio_mutex, NULL);
 	obs_get_video_info(&f->ovi);
@@ -907,6 +965,11 @@ void ndi_filter_destroy(void *data)
 	auto name = obs_source_get_name(f->obs_source);
 	obs_log(LOG_DEBUG, "+ndi_filter_destroy('%s'...)", name);
 
+	if (f->offscreen_registered) {
+		obs_remove_main_render_callback(ndi_filter_offscreen_render, f);
+		f->offscreen_registered = false;
+	}
+
 	ndi_filter_release_active(f);
 	ndi_filter_disconnect_rename_handlers(f);
 
@@ -923,6 +986,7 @@ void ndi_filter_destroy(void *data)
 	gs_stagesurface_unmap(f->stagesurface);
 	gs_stagesurface_destroy(f->stagesurface);
 	gs_texrender_destroy(f->texrender);
+	gs_texrender_destroy(f->offscreen);
 	obs_leave_graphics();
 
 	if (f->audio_conv_buffer) {
