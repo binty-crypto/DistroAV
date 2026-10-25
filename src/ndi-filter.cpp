@@ -24,9 +24,58 @@
 #include <QDesktopServices>
 #include <QUrl>
 
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
+
 #define TEXFORMAT GS_BGRA
 #define FLT_PROP_NAME "ndi_filter_ndiname"
 #define FLT_PROP_GROUPS "ndi_filter_ndigroups"
+#define FLT_PROP_FPS_LIMIT "ndi_filter_fps_limit"
+#define FLT_PROP_READBACK_DELAY "ndi_filter_readback_delay"
+
+// Asynchronous GPU readback
+// -------------------------
+// The stock filter stages the rendered texture and maps it in the same frame, which makes the
+// render thread wait for the GPU copy to finish, once per filter per frame. With many
+// "Dedicated NDI Output" filters that wait dominates the frame time.
+//
+// With readback_delay > 0 we keep a small ring of staging surfaces: each frame we stage into a
+// free slot and map a slot that was staged `readback_delay` filter-frames ago, whose copy has
+// long since finished, so map() returns immediately. The mapped pointer is handed to a per-filter
+// worker thread that performs the NDI send; the render thread unmaps the slot on a later frame
+// once the worker is done. The row-copy into video_output is skipped on this path.
+#define MAX_STAGE_SLOTS 4
+#define MAX_READBACK_DELAY (MAX_STAGE_SLOTS - 2)
+
+enum stage_state { STAGE_FREE = 0, STAGE_STAGED, STAGE_MAPPED };
+
+struct stage_slot {
+	gs_stagesurf_t *surf;
+	stage_state state;
+	uint64_t seq;       // filter-frame number at which it was staged
+	uint64_t timestamp; // OBS timestamp of the staged frame
+	uint8_t *data;      // valid while STAGE_MAPPED
+	uint32_t linesize;
+	bool worker_done; // worker has finished with the mapped data (guarded by worker mutex)
+};
+
+struct readback_job {
+	int slot;
+	uint8_t *data;
+	uint32_t linesize;
+	uint64_t timestamp;
+};
+
+struct readback_worker {
+	std::thread thread;
+	std::mutex mutex;
+	std::condition_variable cv;
+	std::deque<readback_job> queue;
+	bool stop = false;
+	int in_flight = 0;
+};
 
 typedef struct {
 	obs_source_t *obs_source;
@@ -47,6 +96,18 @@ typedef struct {
 	gs_stagesurf_t *stagesurface;
 	uint8_t *video_data;
 	uint32_t video_linesize;
+
+	// Frame rate limit (0 = match OBS)
+	uint32_t fps_limit;
+	uint64_t next_frame_ns;
+
+	// Async readback ring
+	uint32_t readback_delay; // 0 = synchronous (stock behaviour)
+	uint32_t ring_size;      // readback_delay + 2 while async, 0 while sync
+	stage_slot slots[MAX_STAGE_SLOTS];
+	uint64_t frame_seq;
+	readback_worker *worker;
+	bool dropped_logged;
 #ifdef SYNC_DEBUG
 	// Time offset to apply to OBS timestamps to synchronize with NDI timestamps
 	uint64_t obs_to_ndi_time_offset;
@@ -131,6 +192,32 @@ obs_properties_t *ndi_filter_getproperties(void *priv)
 	obs_properties_add_text(props, FLT_PROP_GROUPS, obs_module_text("NDIPlugin.FilterProps.NDIGroups"),
 				OBS_TEXT_DEFAULT);
 
+	obs_property_t *fps_property = obs_properties_add_list(props, FLT_PROP_FPS_LIMIT,
+							       obs_module_text("NDIPlugin.FilterProps.FpsLimit"),
+							       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(fps_property, obs_module_text("NDIPlugin.FilterProps.FpsLimit.MatchOBS"), 0);
+	const int fps_options[] = {60, 50, 30, 25, 15, 10, 5, 2, 1};
+	for (int fps : fps_options) {
+		char label[16];
+		snprintf(label, sizeof(label), "%d fps", fps);
+		obs_property_list_add_int(fps_property, label, fps);
+	}
+	obs_property_set_long_description(fps_property, obs_module_text("NDIPlugin.FilterProps.FpsLimit.Description"));
+
+	obs_property_t *delay_property = obs_properties_add_list(props, FLT_PROP_READBACK_DELAY,
+								 obs_module_text("NDIPlugin.FilterProps.ReadbackDelay"),
+								 OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(delay_property, obs_module_text("NDIPlugin.FilterProps.ReadbackDelay.Sync"), 0);
+	for (int d = 1; d <= MAX_READBACK_DELAY; d++) {
+		char label[32];
+		snprintf(label, sizeof(label), "%d %s", d,
+			 obs_module_text(d == 1 ? "NDIPlugin.FilterProps.ReadbackDelay.Frame"
+						: "NDIPlugin.FilterProps.ReadbackDelay.Frames"));
+		obs_property_list_add_int(delay_property, label, d);
+	}
+	obs_property_set_long_description(delay_property,
+					  obs_module_text("NDIPlugin.FilterProps.ReadbackDelay.Description"));
+
 	obs_properties_add_button2(
 		props, "ndi_apply", obs_module_text("NDIPlugin.FilterProps.ApplySettings"),
 		[](obs_properties_t *, obs_property_t *, void *private_data) {
@@ -151,6 +238,8 @@ void ndi_filter_getdefaults(obs_data_t *defaults)
 	obs_log(LOG_DEBUG, "+ndi_filter_getdefaults(...)");
 	obs_data_set_default_string(defaults, FLT_PROP_NAME, obs_module_text("NDIPlugin.FilterProps.NDIName.Default"));
 	obs_data_set_default_string(defaults, FLT_PROP_GROUPS, "");
+	obs_data_set_default_int(defaults, FLT_PROP_FPS_LIMIT, 0);
+	obs_data_set_default_int(defaults, FLT_PROP_READBACK_DELAY, 1);
 	obs_log(LOG_DEBUG, "-ndi_filter_getdefaults(...)");
 }
 
@@ -208,8 +297,13 @@ void ndi_filter_raw_video(void *data, video_data *frame)
 		video_frame.xres = f->known_width;
 		video_frame.yres = f->known_height;
 		video_frame.FourCC = NDIlib_FourCC_type_BGRA;
-		video_frame.frame_rate_N = f->ovi.fps_num;
-		video_frame.frame_rate_D = f->ovi.fps_den;
+		if (f->fps_limit > 0) {
+			video_frame.frame_rate_N = f->fps_limit;
+			video_frame.frame_rate_D = 1;
+		} else {
+			video_frame.frame_rate_N = f->ovi.fps_num;
+			video_frame.frame_rate_D = f->ovi.fps_den;
+		}
 		video_frame.picture_aspect_ratio = 0; // square pixels
 		video_frame.frame_format_type = NDIlib_frame_format_type_progressive;
 #ifdef SYNC_DEBUG
@@ -228,6 +322,167 @@ void ndi_filter_raw_video(void *data, video_data *frame)
 	if (f->ndi_sender)
 		ndiLib->send_send_video_v2(f->ndi_sender, &video_frame);
 	pthread_mutex_unlock(&f->ndi_sender_video_mutex);
+}
+
+// ---- async readback worker -------------------------------------------------
+
+static void readback_worker_loop(ndi_filter_t *f)
+{
+	os_set_thread_name("ndi-filter-readback");
+	readback_worker *w = f->worker;
+	for (;;) {
+		readback_job job;
+		{
+			std::unique_lock<std::mutex> lk(w->mutex);
+			w->cv.wait(lk, [w] { return w->stop || !w->queue.empty(); });
+			if (w->queue.empty())
+				break; // stop requested and nothing left to send
+			job = w->queue.front();
+			w->queue.pop_front();
+		}
+
+		video_data frame = {};
+		frame.data[0] = job.data;
+		frame.linesize[0] = job.linesize;
+		frame.timestamp = job.timestamp;
+		ndi_filter_raw_video(f, &frame); // synchronous NDI send; buffer is free on return
+
+		{
+			std::lock_guard<std::mutex> lk(w->mutex);
+			f->slots[job.slot].worker_done = true;
+			w->in_flight--;
+		}
+		w->cv.notify_all();
+	}
+}
+
+static void readback_worker_start(ndi_filter_t *f)
+{
+	if (f->worker)
+		return;
+	f->worker = new readback_worker();
+	f->worker->thread = std::thread(readback_worker_loop, f);
+}
+
+// Wait until the worker has finished every queued send. Graphics thread only.
+static void readback_drain(ndi_filter_t *f)
+{
+	if (!f->worker)
+		return;
+	std::unique_lock<std::mutex> lk(f->worker->mutex);
+	f->worker->cv.wait_for(lk, std::chrono::milliseconds(500), [f] { return f->worker->in_flight == 0; });
+}
+
+static void readback_worker_stop(ndi_filter_t *f)
+{
+	if (!f->worker)
+		return;
+	{
+		std::lock_guard<std::mutex> lk(f->worker->mutex);
+		f->worker->stop = true;
+	}
+	f->worker->cv.notify_all();
+	if (f->worker->thread.joinable())
+		f->worker->thread.join();
+	delete f->worker;
+	f->worker = nullptr;
+}
+
+// Unmap and free every staging slot. Graphics thread only; drains the worker first.
+static void readback_ring_destroy(ndi_filter_t *f)
+{
+	readback_drain(f);
+	for (int i = 0; i < MAX_STAGE_SLOTS; i++) {
+		stage_slot &s = f->slots[i];
+		if (s.state == STAGE_MAPPED && s.surf)
+			gs_stagesurface_unmap(s.surf);
+		gs_stagesurface_destroy(s.surf);
+		s = {};
+	}
+	f->ring_size = 0;
+	if (f->worker) {
+		std::lock_guard<std::mutex> lk(f->worker->mutex);
+		f->worker->queue.clear();
+	}
+}
+
+static void readback_ring_create(ndi_filter_t *f, uint32_t width, uint32_t height)
+{
+	readback_ring_destroy(f);
+	f->ring_size = f->readback_delay + 2;
+	for (uint32_t i = 0; i < f->ring_size; i++) {
+		f->slots[i].surf = gs_stagesurface_create(width, height, TEXFORMAT);
+		f->slots[i].state = STAGE_FREE;
+	}
+	f->frame_seq = 0;
+	f->dropped_logged = false;
+}
+
+// Async path: stage this frame, map an older one, hand it to the worker.
+static void ndi_filter_readback_async(ndi_filter_t *f, gs_texture_t *tex, uint64_t timestamp)
+{
+	// 1. Release slots the worker has finished with.
+	{
+		std::lock_guard<std::mutex> lk(f->worker->mutex);
+		for (uint32_t i = 0; i < f->ring_size; i++) {
+			stage_slot &s = f->slots[i];
+			if (s.state == STAGE_MAPPED && s.worker_done) {
+				gs_stagesurface_unmap(s.surf);
+				s.state = STAGE_FREE;
+				s.worker_done = false;
+				s.data = nullptr;
+			}
+		}
+	}
+
+	// 2. Stage the current frame into a free slot (queues the GPU copy, does not wait).
+	int free_idx = -1;
+	for (uint32_t i = 0; i < f->ring_size; i++) {
+		if (f->slots[i].state == STAGE_FREE) {
+			free_idx = (int)i;
+			break;
+		}
+	}
+	if (free_idx < 0) {
+		// Worker is behind (NDI send slower than frame rate); drop this frame rather than stall.
+		if (!f->dropped_logged) {
+			obs_log(LOG_WARNING, "'%s': readback ring full, dropping frames (NDI send is lagging)",
+				obs_source_get_name(f->obs_source));
+			f->dropped_logged = true;
+		}
+		return;
+	}
+	f->frame_seq++;
+	stage_slot &cur = f->slots[free_idx];
+	gs_stage_texture(cur.surf, tex);
+	cur.state = STAGE_STAGED;
+	cur.seq = f->frame_seq;
+	cur.timestamp = timestamp;
+
+	// 3. Map the oldest staged slot that is at least `readback_delay` frames old.
+	int map_idx = -1;
+	for (uint32_t i = 0; i < f->ring_size; i++) {
+		stage_slot &s = f->slots[i];
+		if (s.state == STAGE_STAGED && s.seq + f->readback_delay <= f->frame_seq &&
+		    (map_idx < 0 || s.seq < f->slots[map_idx].seq))
+			map_idx = (int)i;
+	}
+	if (map_idx < 0)
+		return;
+
+	stage_slot &old = f->slots[map_idx];
+	if (!gs_stagesurface_map(old.surf, &old.data, &old.linesize)) {
+		old.state = STAGE_FREE;
+		return;
+	}
+	old.state = STAGE_MAPPED;
+	old.worker_done = false;
+	{
+		std::lock_guard<std::mutex> lk(f->worker->mutex);
+		f->worker->queue.push_back({map_idx, old.data, old.linesize, old.timestamp});
+		f->worker->in_flight++;
+	}
+	f->worker->cv.notify_one();
 }
 
 void ndi_filter_render_video(void *data, gs_effect_t *)
@@ -251,10 +506,38 @@ void ndi_filter_render_video(void *data, gs_effect_t *)
 		return;
 	}
 
+	// Frame rate limit: skip the render entirely until the next slot is due.
+	const uint64_t now = os_gettime_ns();
+	if (f->fps_limit > 0) {
+		const uint64_t interval = 1000000000ULL / f->fps_limit;
+		if (f->next_frame_ns == 0)
+			f->next_frame_ns = now;
+		// Quarter-interval tolerance so OBS frame jitter doesn't make us skip a whole extra frame.
+		if (now + interval / 4 < f->next_frame_ns) {
+			f->rendered = true;
+			return;
+		}
+		f->next_frame_ns += interval;
+		if (f->next_frame_ns < now)
+			f->next_frame_ns = now + interval;
+	}
+
 	uint32_t width = obs_source_get_width(f->obs_source);
 	uint32_t height = obs_source_get_height(f->obs_source);
 
-	if (f->known_width != width || f->known_height != height) {
+	const bool async = f->readback_delay > 0;
+	const bool size_changed = f->known_width != width || f->known_height != height;
+
+	if (async) {
+		if (!f->worker)
+			readback_worker_start(f);
+		if (size_changed || f->ring_size != f->readback_delay + 2)
+			readback_ring_create(f, width, height);
+	} else if (f->ring_size) {
+		readback_ring_destroy(f);
+	}
+
+	if (size_changed) {
 		gs_stagesurface_destroy(f->stagesurface);
 		f->stagesurface = gs_stagesurface_create(width, height, TEXFORMAT);
 
@@ -298,10 +581,16 @@ void ndi_filter_render_video(void *data, gs_effect_t *)
 		gs_blend_state_pop();
 		gs_texrender_end(f->texrender);
 
+		if (async) {
+			ndi_filter_readback_async(f, gs_texrender_get_texture(f->texrender), now);
+			f->rendered = true;
+			return;
+		}
+
 		gs_stage_texture(f->stagesurface, gs_texrender_get_texture(f->texrender));
 		if (gs_stagesurface_map(f->stagesurface, &f->video_data, &f->video_linesize)) {
 			video_frame output_frame;
-			if (video_output_lock_frame(f->video_output, &output_frame, 1, os_gettime_ns())) {
+			if (video_output_lock_frame(f->video_output, &output_frame, 1, now)) {
 				uint32_t linesize = output_frame.linesize[0];
 				for (uint32_t i = 0; i < f->known_height; ++i) {
 					uint32_t dst_offset = linesize * i;
@@ -461,7 +750,23 @@ void ndi_filter_update(void *data, obs_data_t *settings)
 
 	auto groups = obs_data_get_string(settings, FLT_PROP_GROUPS);
 
-	obs_log(LOG_INFO, "NDI Filter Updated: '%s'", name);
+	if (!f->is_audioonly) {
+		long long fps = obs_data_get_int(settings, FLT_PROP_FPS_LIMIT);
+		long long delay = obs_data_get_int(settings, FLT_PROP_READBACK_DELAY);
+		if (fps < 0)
+			fps = 0;
+		if (delay < 0)
+			delay = 0;
+		if (delay > MAX_READBACK_DELAY)
+			delay = MAX_READBACK_DELAY;
+		f->fps_limit = (uint32_t)fps;
+		f->next_frame_ns = 0;
+		// The ring is (re)built on the graphics thread in render_video when this changes.
+		f->readback_delay = (uint32_t)delay;
+	}
+
+	obs_log(LOG_INFO, "NDI Filter Updated: '%s' (fps limit %u, readback delay %u)", name, f->fps_limit,
+		f->readback_delay);
 	obs_log(LOG_DEBUG, "-ndi_filter_update(name='%s', groups='%s')", name, groups);
 }
 
@@ -517,11 +822,18 @@ void ndi_filter_destroy(void *data)
 
 	video_output_close(f->video_output);
 
+	// Let the worker finish any in-flight send, then stop it, before the sender and surfaces go.
+	readback_drain(f);
+	readback_worker_stop(f);
+
 	ndi_sender_destroy(f);
 
+	obs_enter_graphics();
+	readback_ring_destroy(f);
 	gs_stagesurface_unmap(f->stagesurface);
 	gs_stagesurface_destroy(f->stagesurface);
 	gs_texrender_destroy(f->texrender);
+	obs_leave_graphics();
 
 	if (f->audio_conv_buffer) {
 		obs_log(LOG_DEBUG, "ndi_filter_destroy: freeing %zu bytes", f->audio_conv_buffer_size);
