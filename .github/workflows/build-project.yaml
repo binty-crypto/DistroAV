@@ -78,6 +78,7 @@ jobs:
 
   macos-build:
     name: Build for macOS 🍏
+    if: false # Blackstock build: Windows only
     runs-on: macos-15
     timeout-minutes: 10
     needs: check-event
@@ -183,6 +184,7 @@ jobs:
 
   ubuntu-build:
     name: Build for Ubuntu 🐧
+    if: false # Blackstock build: Windows only
     strategy:
       matrix:
         os: [ubuntu-24.04]
@@ -259,7 +261,7 @@ jobs:
   windows-build:
     name: Build for Windows 🪟
     runs-on: windows-2022
-    timeout-minutes: 10
+    timeout-minutes: 25
     needs: check-event
     defaults:
       run:
