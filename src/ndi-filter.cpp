@@ -35,6 +35,9 @@
 #define FLT_PROP_FPS_LIMIT "ndi_filter_fps_limit"
 #define FLT_PROP_READBACK_DELAY "ndi_filter_readback_delay"
 #define FLT_PROP_KEEP_ACTIVE "ndi_filter_keep_active"
+#define FLT_PROP_AUTO_STILL_FPS "ndi_filter_auto_still_fps"
+#define FLT_PROP_AUTO_SLOW_FPS "ndi_filter_auto_slow_fps"
+#define FPS_LIMIT_AUTO (-1) // value of FLT_PROP_FPS_LIMIT meaning "auto"
 
 // Asynchronous GPU readback
 // -------------------------
@@ -99,8 +102,13 @@ typedef struct {
 	uint32_t video_linesize;
 
 	// Frame rate limit (0 = match OBS)
-	uint32_t fps_limit;
+	uint32_t fps_limit; // configured limit (0 = match OBS); ignored when fps_auto
 	uint64_t next_frame_ns;
+	bool fps_auto;           // choose the rate from what is visible in the scene
+	uint32_t auto_still_fps; // rate used by auto mode when only still sources are visible
+	uint32_t auto_slow_fps;  // rate used by auto mode when the fastest visible source is a slideshow
+	uint32_t effective_fps;  // the limit actually in force this frame (0 = match OBS)
+	uint64_t last_motion_check_ns;
 
 	// Async readback ring
 	uint32_t readback_delay; // 0 = synchronous (stock behaviour)
@@ -235,6 +243,7 @@ obs_properties_t *ndi_filter_getproperties(void *priv)
 							       obs_module_text("NDIPlugin.FilterProps.FpsLimit"),
 							       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
 	obs_property_list_add_int(fps_property, obs_module_text("NDIPlugin.FilterProps.FpsLimit.MatchOBS"), 0);
+	obs_property_list_add_int(fps_property, obs_module_text("NDIPlugin.FilterProps.FpsLimit.Auto"), FPS_LIMIT_AUTO);
 	const int fps_options[] = {60, 50, 30, 25, 15, 10, 5, 2, 1};
 	for (int fps : fps_options) {
 		char label[16];
@@ -242,6 +251,30 @@ obs_properties_t *ndi_filter_getproperties(void *priv)
 		obs_property_list_add_int(fps_property, label, fps);
 	}
 	obs_property_set_long_description(fps_property, obs_module_text("NDIPlugin.FilterProps.FpsLimit.Description"));
+
+	obs_property_t *still_property = obs_properties_add_list(props, FLT_PROP_AUTO_STILL_FPS,
+								 obs_module_text("NDIPlugin.FilterProps.AutoStillFps"),
+								 OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	const int still_options[] = {10, 5, 2, 1};
+	for (int fps : still_options) {
+		char label[16];
+		snprintf(label, sizeof(label), "%d fps", fps);
+		obs_property_list_add_int(still_property, label, fps);
+	}
+	obs_property_set_long_description(still_property,
+					  obs_module_text("NDIPlugin.FilterProps.AutoStillFps.Description"));
+
+	obs_property_t *slow_property = obs_properties_add_list(props, FLT_PROP_AUTO_SLOW_FPS,
+								obs_module_text("NDIPlugin.FilterProps.AutoSlowFps"),
+								OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	const int slow_options[] = {30, 25, 15, 10, 5};
+	for (int fps : slow_options) {
+		char label[16];
+		snprintf(label, sizeof(label), "%d fps", fps);
+		obs_property_list_add_int(slow_property, label, fps);
+	}
+	obs_property_set_long_description(slow_property,
+					  obs_module_text("NDIPlugin.FilterProps.AutoSlowFps.Description"));
 
 	obs_property_t *delay_property = obs_properties_add_list(props, FLT_PROP_READBACK_DELAY,
 								 obs_module_text("NDIPlugin.FilterProps.ReadbackDelay"),
@@ -283,6 +316,8 @@ void ndi_filter_getdefaults(obs_data_t *defaults)
 	obs_data_set_default_string(defaults, FLT_PROP_NAME, obs_module_text("NDIPlugin.FilterProps.NDIName.Default"));
 	obs_data_set_default_string(defaults, FLT_PROP_GROUPS, "");
 	obs_data_set_default_int(defaults, FLT_PROP_FPS_LIMIT, 0);
+	obs_data_set_default_int(defaults, FLT_PROP_AUTO_STILL_FPS, 2);
+	obs_data_set_default_int(defaults, FLT_PROP_AUTO_SLOW_FPS, 10);
 	obs_data_set_default_int(defaults, FLT_PROP_READBACK_DELAY, 1);
 	obs_data_set_default_bool(defaults, FLT_PROP_KEEP_ACTIVE, true);
 	obs_log(LOG_DEBUG, "-ndi_filter_getdefaults(...)");
@@ -342,8 +377,8 @@ void ndi_filter_raw_video(void *data, video_data *frame)
 		video_frame.xres = f->known_width;
 		video_frame.yres = f->known_height;
 		video_frame.FourCC = NDIlib_FourCC_type_BGRA;
-		if (f->fps_limit > 0) {
-			video_frame.frame_rate_N = f->fps_limit;
+		if (f->effective_fps > 0) {
+			video_frame.frame_rate_N = f->effective_fps;
 			video_frame.frame_rate_D = 1;
 		} else {
 			video_frame.frame_rate_N = f->ovi.fps_num;
@@ -553,8 +588,8 @@ void ndi_filter_render_video(void *data, gs_effect_t *)
 
 	// Frame rate limit: skip the render entirely until the next slot is due.
 	const uint64_t now = os_gettime_ns();
-	if (f->fps_limit > 0) {
-		const uint64_t interval = 1000000000ULL / f->fps_limit;
+	if (f->effective_fps > 0) {
+		const uint64_t interval = 1000000000ULL / f->effective_fps;
 		if (f->next_frame_ns == 0)
 			f->next_frame_ns = now;
 		// Quarter-interval tolerance so OBS frame jitter doesn't make us skip a whole extra frame.
@@ -798,13 +833,20 @@ void ndi_filter_update(void *data, obs_data_t *settings)
 	if (!f->is_audioonly) {
 		long long fps = obs_data_get_int(settings, FLT_PROP_FPS_LIMIT);
 		long long delay = obs_data_get_int(settings, FLT_PROP_READBACK_DELAY);
+		f->fps_auto = (fps == FPS_LIMIT_AUTO);
 		if (fps < 0)
 			fps = 0;
+		long long still = obs_data_get_int(settings, FLT_PROP_AUTO_STILL_FPS);
+		f->auto_still_fps = (still > 0 && still <= 60) ? (uint32_t)still : 2;
+		long long slow = obs_data_get_int(settings, FLT_PROP_AUTO_SLOW_FPS);
+		f->auto_slow_fps = (slow > 0 && slow <= 60) ? (uint32_t)slow : 10;
+		f->last_motion_check_ns = 0;
 		if (delay < 0)
 			delay = 0;
 		if (delay > MAX_READBACK_DELAY)
 			delay = MAX_READBACK_DELAY;
 		f->fps_limit = (uint32_t)fps;
+		f->effective_fps = f->fps_auto ? f->auto_still_fps : f->fps_limit;
 		f->next_frame_ns = 0;
 		// The ring is (re)built on the graphics thread in render_video when this changes.
 		f->readback_delay = (uint32_t)delay;
@@ -915,11 +957,101 @@ void ndi_filter_destroy_audioonly(void *data)
 	obs_log(LOG_DEBUG, "-ndi_filter_destroy_audioonly('%s'...)", name);
 }
 
+// ---- auto frame rate -------------------------------------------------------
+// Each visible source is classed as STILL (images, solid colours, plain text:
+// nothing changes on its own), SLOW (slideshows: a transition every few
+// seconds) or FAST (media, browser, captures, NDI inputs, anything else). The
+// scene takes the class of its fastest visible source. A still source with a
+// filter on it counts as FAST, since filters like Scroll animate it.
+
+enum motion_class { MOTION_STILL = 0, MOTION_SLOW = 1, MOTION_FAST = 2 };
+
+static motion_class source_motion_class(obs_source_t *src)
+{
+	const char *id = obs_source_get_unversioned_id(src);
+	if (!id)
+		return MOTION_FAST;
+	static const char *const still_ids[] = {"image_source", "color_source", "text_gdiplus", "text_ft2_source",
+						"text_pango_source"};
+	for (const char *s : still_ids) {
+		if (strcmp(id, s) == 0)
+			return obs_source_filter_count(src) == 0 ? MOTION_STILL : MOTION_FAST;
+	}
+	if (strcmp(id, "slideshow") == 0)
+		return MOTION_SLOW;
+	return MOTION_FAST;
+}
+
+struct motion_scan {
+	motion_class level;
+	int depth;
+};
+
+static motion_class scene_motion_class(obs_source_t *container, int depth);
+
+static bool motion_scan_item(obs_scene_t *, obs_sceneitem_t *item, void *param)
+{
+	auto scan = (motion_scan *)param;
+	if (!obs_sceneitem_visible(item))
+		return true;
+	obs_source_t *src = obs_sceneitem_get_source(item);
+	if (!src)
+		return true;
+	motion_class c;
+	if (obs_sceneitem_is_group(item) || obs_source_get_type(src) == OBS_SOURCE_TYPE_SCENE)
+		c = scene_motion_class(src, scan->depth + 1);
+	else
+		c = source_motion_class(src);
+	if (c > scan->level)
+		scan->level = c;
+	return scan->level < MOTION_FAST; // stop enumerating once nothing can raise it further
+}
+
+static motion_class scene_motion_class(obs_source_t *container, int depth)
+{
+	if (depth > 8)
+		return MOTION_FAST; // absurd nesting; play safe
+	obs_scene_t *scene = obs_scene_from_source(container);
+	if (!scene)
+		scene = obs_group_from_source(container);
+	if (!scene)
+		return source_motion_class(container); // filter is on a plain source, not a scene
+	motion_scan scan = {MOTION_STILL, depth};
+	obs_scene_enum_items(scene, motion_scan_item, &scan);
+	return scan.level;
+}
+
 void ndi_filter_tick(void *data, float)
 {
 	auto f = (ndi_filter_t *)data;
 
 	obs_get_video_info(&f->ovi);
+
+	if (f->fps_auto && !f->is_audioonly) {
+		const uint64_t now = os_gettime_ns();
+		if (now - f->last_motion_check_ns >= 500000000ULL) { // every 0.5 s
+			f->last_motion_check_ns = now;
+			obs_source_t *parent = obs_filter_get_parent(f->obs_source);
+			uint32_t want = 0;
+			if (parent) {
+				switch (scene_motion_class(parent, 0)) {
+				case MOTION_STILL:
+					want = f->auto_still_fps;
+					break;
+				case MOTION_SLOW:
+					want = f->auto_slow_fps;
+					break;
+				case MOTION_FAST:
+					want = 0;
+					break;
+				}
+			}
+			if (want != f->effective_fps) {
+				f->effective_fps = want;
+				f->next_frame_ns = 0; // re-sync so a newly shown video starts immediately
+			}
+		}
+	}
 
 	f->rendered = false;
 }
