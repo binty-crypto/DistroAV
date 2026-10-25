@@ -34,6 +34,7 @@
 #define FLT_PROP_GROUPS "ndi_filter_ndigroups"
 #define FLT_PROP_FPS_LIMIT "ndi_filter_fps_limit"
 #define FLT_PROP_READBACK_DELAY "ndi_filter_readback_delay"
+#define FLT_PROP_KEEP_ACTIVE "ndi_filter_keep_active"
 
 // Asynchronous GPU readback
 // -------------------------
@@ -108,6 +109,13 @@ typedef struct {
 	uint64_t frame_seq;
 	readback_worker *worker;
 	bool dropped_logged;
+
+	// Keep the parent source active while this filter is attached, so media and
+	// slideshows play and the output is valid without the scene being in Program,
+	// Preview or a Multiview.
+	bool keep_active;          // setting
+	bool holding_active;       // we currently hold an active ref on the parent
+	obs_source_t *held_parent; // the parent we took the ref on
 #ifdef SYNC_DEBUG
 	// Time offset to apply to OBS timestamps to synchronize with NDI timestamps
 	uint64_t obs_to_ndi_time_offset;
@@ -156,6 +164,37 @@ void on_renamed(void *data, calldata_t *)
 		obs_source_get_name(f->obs_source));
 	// Recreate sender using current settings
 	ndi_sender_create(f, nullptr);
+}
+
+// ---- keep parent active ---------------------------------------------------
+// Holding an 'active' reference on the parent makes OBS treat it (and its
+// children) as if it were in Program: media sources and slideshows play, and
+// obs_source_showing() is true so the output is valid. Reference counted, so it
+// coexists with the scene actually being in Program or Preview.
+
+static void ndi_filter_release_active(ndi_filter_t *f)
+{
+	if (!f->holding_active)
+		return;
+	if (f->held_parent)
+		obs_source_dec_active(f->held_parent);
+	f->holding_active = false;
+	f->held_parent = nullptr;
+}
+
+static void ndi_filter_apply_keep_active(ndi_filter_t *f)
+{
+	if (f->is_audioonly)
+		return;
+	obs_source_t *parent = obs_filter_get_parent(f->obs_source);
+	bool want = f->keep_active && parent != nullptr;
+	if (f->holding_active && (!want || f->held_parent != parent))
+		ndi_filter_release_active(f);
+	if (want && !f->holding_active) {
+		obs_source_inc_active(parent);
+		f->held_parent = parent;
+		f->holding_active = true;
+	}
 }
 
 static void ndi_filter_disconnect_rename_handlers(ndi_filter_t *filter)
@@ -218,6 +257,11 @@ obs_properties_t *ndi_filter_getproperties(void *priv)
 	obs_property_set_long_description(delay_property,
 					  obs_module_text("NDIPlugin.FilterProps.ReadbackDelay.Description"));
 
+	obs_property_t *keep_property = obs_properties_add_bool(props, FLT_PROP_KEEP_ACTIVE,
+								obs_module_text("NDIPlugin.FilterProps.KeepActive"));
+	obs_property_set_long_description(keep_property,
+					  obs_module_text("NDIPlugin.FilterProps.KeepActive.Description"));
+
 	obs_properties_add_button2(
 		props, "ndi_apply", obs_module_text("NDIPlugin.FilterProps.ApplySettings"),
 		[](obs_properties_t *, obs_property_t *, void *private_data) {
@@ -240,6 +284,7 @@ void ndi_filter_getdefaults(obs_data_t *defaults)
 	obs_data_set_default_string(defaults, FLT_PROP_GROUPS, "");
 	obs_data_set_default_int(defaults, FLT_PROP_FPS_LIMIT, 0);
 	obs_data_set_default_int(defaults, FLT_PROP_READBACK_DELAY, 1);
+	obs_data_set_default_bool(defaults, FLT_PROP_KEEP_ACTIVE, true);
 	obs_log(LOG_DEBUG, "-ndi_filter_getdefaults(...)");
 }
 
@@ -763,6 +808,8 @@ void ndi_filter_update(void *data, obs_data_t *settings)
 		f->next_frame_ns = 0;
 		// The ring is (re)built on the graphics thread in render_video when this changes.
 		f->readback_delay = (uint32_t)delay;
+		f->keep_active = obs_data_get_bool(settings, FLT_PROP_KEEP_ACTIVE);
+		ndi_filter_apply_keep_active(f);
 	}
 
 	obs_log(LOG_INFO, "NDI Filter Updated: '%s' (fps limit %u, readback delay %u)", name, f->fps_limit,
@@ -818,6 +865,7 @@ void ndi_filter_destroy(void *data)
 	auto name = obs_source_get_name(f->obs_source);
 	obs_log(LOG_DEBUG, "+ndi_filter_destroy('%s'...)", name);
 
+	ndi_filter_release_active(f);
 	ndi_filter_disconnect_rename_handlers(f);
 
 	video_output_close(f->video_output);
@@ -881,6 +929,7 @@ void ndi_filter_add(void *data, obs_source_t * /* parent */)
 	auto f = (ndi_filter_t *)data;
 	if (!f->ndi_sender)
 		ndi_sender_create(f, nullptr);
+	ndi_filter_apply_keep_active(f);
 }
 
 void ndi_filter_remove(void *data, obs_source_t * /* parent */)
@@ -889,6 +938,7 @@ void ndi_filter_remove(void *data, obs_source_t * /* parent */)
 	if (!f)
 		return;
 
+	ndi_filter_release_active(f);
 	ndi_filter_disconnect_rename_handlers(f);
 	ndi_sender_destroy(f);
 }
