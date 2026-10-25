@@ -104,7 +104,7 @@ typedef struct {
 	// Async readback ring
 	uint32_t readback_delay; // 0 = synchronous (stock behaviour)
 	uint32_t ring_size;      // readback_delay + 2 while async, 0 while sync
-	stage_slot slots[MAX_STAGE_SLOTS];
+	stage_slot stage_ring[MAX_STAGE_SLOTS];
 	uint64_t frame_seq;
 	readback_worker *worker;
 	bool dropped_logged;
@@ -349,7 +349,7 @@ static void readback_worker_loop(ndi_filter_t *f)
 
 		{
 			std::lock_guard<std::mutex> lk(w->mutex);
-			f->slots[job.slot].worker_done = true;
+			f->stage_ring[job.slot].worker_done = true;
 			w->in_flight--;
 		}
 		w->cv.notify_all();
@@ -393,7 +393,7 @@ static void readback_ring_destroy(ndi_filter_t *f)
 {
 	readback_drain(f);
 	for (int i = 0; i < MAX_STAGE_SLOTS; i++) {
-		stage_slot &s = f->slots[i];
+		stage_slot &s = f->stage_ring[i];
 		if (s.state == STAGE_MAPPED && s.surf)
 			gs_stagesurface_unmap(s.surf);
 		gs_stagesurface_destroy(s.surf);
@@ -411,8 +411,8 @@ static void readback_ring_create(ndi_filter_t *f, uint32_t width, uint32_t heigh
 	readback_ring_destroy(f);
 	f->ring_size = f->readback_delay + 2;
 	for (uint32_t i = 0; i < f->ring_size; i++) {
-		f->slots[i].surf = gs_stagesurface_create(width, height, TEXFORMAT);
-		f->slots[i].state = STAGE_FREE;
+		f->stage_ring[i].surf = gs_stagesurface_create(width, height, TEXFORMAT);
+		f->stage_ring[i].state = STAGE_FREE;
 	}
 	f->frame_seq = 0;
 	f->dropped_logged = false;
@@ -421,11 +421,11 @@ static void readback_ring_create(ndi_filter_t *f, uint32_t width, uint32_t heigh
 // Async path: stage this frame, map an older one, hand it to the worker.
 static void ndi_filter_readback_async(ndi_filter_t *f, gs_texture_t *tex, uint64_t timestamp)
 {
-	// 1. Release slots the worker has finished with.
+	// 1. Release stage_ring the worker has finished with.
 	{
 		std::lock_guard<std::mutex> lk(f->worker->mutex);
 		for (uint32_t i = 0; i < f->ring_size; i++) {
-			stage_slot &s = f->slots[i];
+			stage_slot &s = f->stage_ring[i];
 			if (s.state == STAGE_MAPPED && s.worker_done) {
 				gs_stagesurface_unmap(s.surf);
 				s.state = STAGE_FREE;
@@ -438,7 +438,7 @@ static void ndi_filter_readback_async(ndi_filter_t *f, gs_texture_t *tex, uint64
 	// 2. Stage the current frame into a free slot (queues the GPU copy, does not wait).
 	int free_idx = -1;
 	for (uint32_t i = 0; i < f->ring_size; i++) {
-		if (f->slots[i].state == STAGE_FREE) {
+		if (f->stage_ring[i].state == STAGE_FREE) {
 			free_idx = (int)i;
 			break;
 		}
@@ -453,7 +453,7 @@ static void ndi_filter_readback_async(ndi_filter_t *f, gs_texture_t *tex, uint64
 		return;
 	}
 	f->frame_seq++;
-	stage_slot &cur = f->slots[free_idx];
+	stage_slot &cur = f->stage_ring[free_idx];
 	gs_stage_texture(cur.surf, tex);
 	cur.state = STAGE_STAGED;
 	cur.seq = f->frame_seq;
@@ -462,15 +462,15 @@ static void ndi_filter_readback_async(ndi_filter_t *f, gs_texture_t *tex, uint64
 	// 3. Map the oldest staged slot that is at least `readback_delay` frames old.
 	int map_idx = -1;
 	for (uint32_t i = 0; i < f->ring_size; i++) {
-		stage_slot &s = f->slots[i];
+		stage_slot &s = f->stage_ring[i];
 		if (s.state == STAGE_STAGED && s.seq + f->readback_delay <= f->frame_seq &&
-		    (map_idx < 0 || s.seq < f->slots[map_idx].seq))
+		    (map_idx < 0 || s.seq < f->stage_ring[map_idx].seq))
 			map_idx = (int)i;
 	}
 	if (map_idx < 0)
 		return;
 
-	stage_slot &old = f->slots[map_idx];
+	stage_slot &old = f->stage_ring[map_idx];
 	if (!gs_stagesurface_map(old.surf, &old.data, &old.linesize)) {
 		old.state = STAGE_FREE;
 		return;
