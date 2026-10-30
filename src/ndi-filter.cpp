@@ -20,6 +20,8 @@
 #include <util/platform.h>
 #include <util/threading.h>
 #include <media-io/video-frame.h>
+#include <media-io/audio-io.h>
+#include <vector>
 
 #include <QDesktopServices>
 #include <QUrl>
@@ -37,6 +39,7 @@
 #define FLT_PROP_KEEP_ACTIVE "ndi_filter_keep_active"
 #define FLT_PROP_AUTO_STILL_FPS "ndi_filter_auto_still_fps"
 #define FLT_PROP_AUTO_SLOW_FPS "ndi_filter_auto_slow_fps"
+#define FLT_PROP_SEND_AUDIO "ndi_filter_send_audio"
 #define FPS_LIMIT_AUTO (-1) // value of FLT_PROP_FPS_LIMIT meaning "auto"
 
 // Asynchronous GPU readback
@@ -128,6 +131,14 @@ typedef struct {
 	bool offscreen_pass; // true while our own off-screen draw is in progress
 	bool offscreen_registered;
 
+	// Scene audio: on each audio tick, sum the processed audio of every visible
+	// audio-producing source in the scene (nested scenes and groups included) and
+	// send it on this filter's NDI sender. Off by default.
+	bool send_audio;
+	bool audio_cb_registered;
+	float audio_mix[MAX_AUDIO_CHANNELS][AUDIO_OUTPUT_FRAMES];
+	float audio_planar[MAX_AUDIO_CHANNELS * AUDIO_OUTPUT_FRAMES];
+
 	bool keep_active;          // setting
 	bool holding_active;       // we currently hold an active ref on the parent
 	obs_source_t *held_parent; // the parent we took the ref on
@@ -166,6 +177,7 @@ uint64_t now_ns()
 #endif
 
 void ndi_filter_update(void *data, obs_data_t *settings);
+static void ndi_filter_audio_tick(void *data, size_t mix_idx, struct audio_data *tick);
 void ndi_sender_destroy(ndi_filter_t *filter);
 void ndi_sender_create(ndi_filter_t *filter, obs_data_t *settings);
 
@@ -243,6 +255,32 @@ obs_properties_t *ndi_filter_getproperties(void *priv)
 	obs_property_set_long_description(ndi_name_property,
 					  obs_module_text("NDIPlugin.FilterProps.NDIName.Description"));
 
+	{
+		// Read-only line showing the resolved sender name as receivers see it.
+		auto f = (ndi_filter_t *)priv;
+		QString current;
+		if (f && f->ndi_sender) {
+			pthread_mutex_lock(&f->ndi_sender_audio_mutex);
+			if (f->ndi_sender) {
+				auto src = ndiLib->send_get_source_name(f->ndi_sender);
+				if (src && src->p_ndi_name)
+					current = QString::fromUtf8(src->p_ndi_name);
+			}
+			pthread_mutex_unlock(&f->ndi_sender_audio_mutex);
+		}
+		// OBS shows an INFO text property's *value* as its content, so store it in the settings.
+		if (f) {
+			obs_data_t *settings = obs_source_get_settings(f->obs_source);
+			obs_data_set_string(settings, "ndi_filter_current_name",
+					    current.isEmpty() ? "" : current.toUtf8().constData());
+			obs_data_release(settings);
+		}
+		obs_property_t *info = obs_properties_add_text(props, "ndi_filter_current_name",
+							       obs_module_text("NDIPlugin.FilterProps.CurrentName"),
+							       OBS_TEXT_INFO);
+		obs_property_text_set_info_type(info, OBS_TEXT_INFO_NORMAL);
+	}
+
 	obs_properties_add_text(props, FLT_PROP_GROUPS, obs_module_text("NDIPlugin.FilterProps.NDIGroups"),
 				OBS_TEXT_DEFAULT);
 
@@ -297,6 +335,11 @@ obs_properties_t *ndi_filter_getproperties(void *priv)
 	obs_property_set_long_description(delay_property,
 					  obs_module_text("NDIPlugin.FilterProps.ReadbackDelay.Description"));
 
+	obs_property_t *audio_property =
+		obs_properties_add_bool(props, FLT_PROP_SEND_AUDIO, obs_module_text("NDIPlugin.FilterProps.SendAudio"));
+	obs_property_set_long_description(audio_property,
+					  obs_module_text("NDIPlugin.FilterProps.SendAudio.Description"));
+
 	obs_property_t *keep_property = obs_properties_add_bool(props, FLT_PROP_KEEP_ACTIVE,
 								obs_module_text("NDIPlugin.FilterProps.KeepActive"));
 	obs_property_set_long_description(keep_property,
@@ -327,6 +370,7 @@ void ndi_filter_getdefaults(obs_data_t *defaults)
 	obs_data_set_default_int(defaults, FLT_PROP_AUTO_SLOW_FPS, 10);
 	obs_data_set_default_int(defaults, FLT_PROP_READBACK_DELAY, 1);
 	obs_data_set_default_bool(defaults, FLT_PROP_KEEP_ACTIVE, true);
+	obs_data_set_default_bool(defaults, FLT_PROP_SEND_AUDIO, false);
 	obs_log(LOG_DEBUG, "-ndi_filter_getdefaults(...)");
 }
 
@@ -907,6 +951,7 @@ void ndi_filter_update(void *data, obs_data_t *settings)
 		// The ring is (re)built on the graphics thread in render_video when this changes.
 		f->readback_delay = (uint32_t)delay;
 		f->keep_active = obs_data_get_bool(settings, FLT_PROP_KEEP_ACTIVE);
+		f->send_audio = obs_data_get_bool(settings, FLT_PROP_SEND_AUDIO);
 		ndi_filter_apply_keep_active(f);
 	}
 
@@ -925,6 +970,8 @@ void *ndi_filter_create(obs_data_t *settings, obs_source_t *obs_source)
 	f->obs_source = obs_source;
 	f->texrender = gs_texrender_create(TEXFORMAT, GS_ZS_NONE);
 	obs_add_main_render_callback(ndi_filter_offscreen_render, f);
+	obs_add_raw_audio_callback(0, nullptr, ndi_filter_audio_tick, f);
+	f->audio_cb_registered = true;
 	f->offscreen_registered = true;
 	pthread_mutex_init(&f->ndi_sender_video_mutex, NULL);
 	pthread_mutex_init(&f->ndi_sender_audio_mutex, NULL);
@@ -965,6 +1012,10 @@ void ndi_filter_destroy(void *data)
 	auto name = obs_source_get_name(f->obs_source);
 	obs_log(LOG_DEBUG, "+ndi_filter_destroy('%s'...)", name);
 
+	if (f->audio_cb_registered) {
+		obs_remove_raw_audio_callback(0, ndi_filter_audio_tick, f);
+		f->audio_cb_registered = false;
+	}
 	if (f->offscreen_registered) {
 		obs_remove_main_render_callback(ndi_filter_offscreen_render, f);
 		f->offscreen_registered = false;
@@ -1019,6 +1070,134 @@ void ndi_filter_destroy_audioonly(void *data)
 
 	obs_log(LOG_INFO, "NDI Audio-Only Filter Destroyed: '%s'", name);
 	obs_log(LOG_DEBUG, "-ndi_filter_destroy_audioonly('%s'...)", name);
+}
+
+// ---- scene audio -----------------------------------------------------------
+// Runs on OBS's audio thread once per audio tick (after OBS has processed every
+// audio source for that tick). We replicate what a scene does for Program: take
+// each visible source's processed track-1 audio, align by timestamp and sum.
+// Sources that are not in Program are still processed by OBS every tick, so
+// their buffers are valid here even though the scene itself is never mixed.
+
+struct audio_src {
+	obs_source_t *src; // holds a reference
+	uint64_t ts;
+};
+struct audio_scan {
+	std::vector<audio_src> list;
+	int depth;
+};
+
+static void audio_scan_source(audio_scan *scan, obs_source_t *src, int depth);
+
+static bool audio_scan_item(obs_scene_t *, obs_sceneitem_t *item, void *param)
+{
+	auto scan = (audio_scan *)param;
+	if (!obs_sceneitem_visible(item))
+		return true;
+	obs_source_t *src = obs_sceneitem_get_source(item);
+	if (src)
+		audio_scan_source(scan, src, scan->depth + 1);
+	return true;
+}
+
+static void audio_scan_source(audio_scan *scan, obs_source_t *src, int depth)
+{
+	if (depth > 8 || scan->list.size() >= 64)
+		return;
+	obs_scene_t *scene = obs_scene_from_source(src);
+	if (!scene)
+		scene = obs_group_from_source(src);
+	if (scene) {
+		int saved = scan->depth;
+		scan->depth = depth;
+		obs_scene_enum_items(scene, audio_scan_item, scan);
+		scan->depth = saved;
+		return;
+	}
+	if (!(obs_source_get_output_flags(src) & OBS_SOURCE_AUDIO))
+		return;
+	if (obs_source_audio_pending(src))
+		return;
+	uint64_t ts = obs_source_get_audio_timestamp(src);
+	if (!ts)
+		return;
+	obs_source_t *ref = obs_source_get_ref(src);
+	if (ref)
+		scan->list.push_back({ref, ts});
+}
+
+static void ndi_filter_audio_tick(void *data, size_t, struct audio_data *tick)
+{
+	auto f = (ndi_filter_t *)data;
+	if (!f->send_audio || !f->ndi_sender || f->is_audioonly)
+		return;
+	obs_source_t *parent = obs_filter_get_parent(f->obs_source);
+	if (!parent || !obs_source_enabled(f->obs_source))
+		return;
+
+	obs_audio_info oai;
+	if (!obs_get_audio_info(&oai))
+		return;
+	const size_t channels = get_audio_channels(oai.speakers);
+	const size_t sample_rate = oai.samples_per_sec;
+	if (!channels || channels > MAX_AUDIO_CHANNELS)
+		return;
+
+	audio_scan scan;
+	scan.depth = 0;
+	audio_scan_source(&scan, parent, 0);
+
+	uint64_t base = 0;
+	for (const audio_src &a : scan.list)
+		if (!base || a.ts < base)
+			base = a.ts;
+
+	bool any = false;
+	if (base) {
+		memset(f->audio_mix, 0, sizeof(f->audio_mix));
+		obs_source_audio_mix child;
+		for (const audio_src &a : scan.list) {
+			size_t pos = (size_t)((a.ts - base) * sample_rate / 1000000000ULL);
+			if (pos >= AUDIO_OUTPUT_FRAMES)
+				continue;
+			obs_source_get_audio_mix(a.src, &child);
+			for (size_t ch = 0; ch < channels; ch++) {
+				const float *in = child.output[0].data[ch];
+				if (!in)
+					continue;
+				float *out = f->audio_mix[ch] + pos;
+				for (size_t i = 0; i < AUDIO_OUTPUT_FRAMES - pos; i++)
+					out[i] += in[i];
+			}
+			any = true;
+		}
+	}
+	for (const audio_src &a : scan.list)
+		obs_source_release(a.src);
+	if (!any)
+		return;
+
+	// Pack planar (FLTP) and send.
+	for (size_t ch = 0; ch < channels; ch++)
+		memcpy(f->audio_planar + ch * AUDIO_OUTPUT_FRAMES, f->audio_mix[ch],
+		       AUDIO_OUTPUT_FRAMES * sizeof(float));
+
+	NDIlib_audio_frame_v3_t frame = {0};
+	frame.sample_rate = (int)sample_rate;
+	frame.no_channels = (int)channels;
+	frame.no_samples = AUDIO_OUTPUT_FRAMES;
+	frame.channel_stride_in_bytes = AUDIO_OUTPUT_FRAMES * sizeof(float);
+	frame.FourCC = NDIlib_FourCC_audio_type_FLTP;
+	frame.timecode = NDIlib_send_timecode_synthesize;
+	frame.p_data = (uint8_t *)f->audio_planar;
+	frame.p_metadata = nullptr;
+	(void)tick;
+
+	pthread_mutex_lock(&f->ndi_sender_audio_mutex);
+	if (f->ndi_sender)
+		ndiLib->send_send_audio_v3(f->ndi_sender, &frame);
+	pthread_mutex_unlock(&f->ndi_sender_audio_mutex);
 }
 
 // ---- auto frame rate -------------------------------------------------------
