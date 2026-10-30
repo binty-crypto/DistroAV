@@ -75,6 +75,23 @@ struct readback_job {
 	uint64_t timestamp;
 };
 
+#include <mutex>
+#define TAP_MAX_QUEUE (AUDIO_OUTPUT_FRAMES * 6) // ~128 ms at 48 kHz; beyond this we skip ahead
+
+struct audio_tap {
+	obs_source_t *src; // holds a reference
+	std::mutex mutex;
+	std::deque<float> ring[MAX_AUDIO_CHANNELS];
+	size_t channels;
+	bool muted;
+	bool seen; // touched by the latest scan
+};
+
+struct audio_taps {
+	std::mutex mutex;
+	std::vector<audio_tap *> list;
+};
+
 struct readback_worker {
 	std::thread thread;
 	std::mutex mutex;
@@ -136,7 +153,8 @@ typedef struct {
 	// send it on this filter's NDI sender. Off by default.
 	bool send_audio;
 	bool audio_cb_registered;
-	float audio_mix[MAX_AUDIO_CHANNELS][AUDIO_OUTPUT_FRAMES];
+	struct audio_taps *taps; // per-source capture buffers (see scene audio section)
+	uint64_t last_tap_scan_ns;
 	float audio_planar[MAX_AUDIO_CHANNELS * AUDIO_OUTPUT_FRAMES];
 
 	bool keep_active;          // setting
@@ -178,6 +196,7 @@ uint64_t now_ns()
 
 void ndi_filter_update(void *data, obs_data_t *settings);
 static void ndi_filter_audio_tick(void *data, size_t mix_idx, struct audio_data *tick);
+static void taps_clear(ndi_filter_t *f);
 void ndi_sender_destroy(ndi_filter_t *filter);
 void ndi_sender_create(ndi_filter_t *filter, obs_data_t *settings);
 
@@ -970,6 +989,7 @@ void *ndi_filter_create(obs_data_t *settings, obs_source_t *obs_source)
 	f->obs_source = obs_source;
 	f->texrender = gs_texrender_create(TEXFORMAT, GS_ZS_NONE);
 	obs_add_main_render_callback(ndi_filter_offscreen_render, f);
+	f->taps = new audio_taps();
 	obs_add_raw_audio_callback(0, nullptr, ndi_filter_audio_tick, f);
 	f->audio_cb_registered = true;
 	f->offscreen_registered = true;
@@ -1016,6 +1036,9 @@ void ndi_filter_destroy(void *data)
 		obs_remove_raw_audio_callback(0, ndi_filter_audio_tick, f);
 		f->audio_cb_registered = false;
 	}
+	taps_clear(f);
+	delete f->taps;
+	f->taps = nullptr;
 	if (f->offscreen_registered) {
 		obs_remove_main_render_callback(ndi_filter_offscreen_render, f);
 		f->offscreen_registered = false;
@@ -1073,37 +1096,59 @@ void ndi_filter_destroy_audioonly(void *data)
 }
 
 // ---- scene audio -----------------------------------------------------------
-// Runs on OBS's audio thread once per audio tick (after OBS has processed every
-// audio source for that tick). We replicate what a scene does for Program: take
-// each visible source's processed track-1 audio, align by timestamp and sum.
-// Sources that are not in Program are still processed by OBS every tick, so
-// their buffers are valid here even though the scene itself is never mixed.
+// Each visible audio-producing source in the scene gets a "tap": a capture
+// callback that receives the source's audio as it arrives (post-filters, float
+// planar at OBS's rate) and queues it. On every OBS audio tick we pull one
+// 1024-frame block from each tap, apply the source's volume and mute, sum, and
+// send on this filter's NDI sender. Buffering between arrival and tick is what
+// keeps the output steady when a device delivers slightly early or late.
 
-struct audio_src {
-	obs_source_t *src; // holds a reference
-	uint64_t ts;
-};
-struct audio_scan {
-	std::vector<audio_src> list;
+static void tap_capture(void *param, obs_source_t *, const struct audio_data *data, bool muted)
+{
+	auto tap = (audio_tap *)param;
+	std::lock_guard<std::mutex> lk(tap->mutex);
+	tap->muted = muted;
+	for (size_t ch = 0; ch < MAX_AUDIO_CHANNELS; ch++) {
+		if (!data->data[ch])
+			continue;
+		if (ch + 1 > tap->channels)
+			tap->channels = ch + 1;
+		const float *in = (const float *)data->data[ch];
+		std::deque<float> &q = tap->ring[ch];
+		q.insert(q.end(), in, in + data->frames);
+		if (q.size() > TAP_MAX_QUEUE) // fell behind: skip ahead rather than grow latency
+			q.erase(q.begin(), q.begin() + (q.size() - AUDIO_OUTPUT_FRAMES * 2));
+	}
+}
+
+static void tap_destroy(audio_tap *tap)
+{
+	obs_source_remove_audio_capture_callback(tap->src, tap_capture, tap);
+	obs_source_release(tap->src);
+	delete tap;
+}
+
+struct tap_scan {
+	ndi_filter_t *f;
 	int depth;
 };
 
-static void audio_scan_source(audio_scan *scan, obs_source_t *src, int depth);
+static void tap_scan_source(tap_scan *scan, obs_source_t *src, int depth);
 
-static bool audio_scan_item(obs_scene_t *, obs_sceneitem_t *item, void *param)
+static bool tap_scan_item(obs_scene_t *, obs_sceneitem_t *item, void *param)
 {
-	auto scan = (audio_scan *)param;
+	auto scan = (tap_scan *)param;
 	if (!obs_sceneitem_visible(item))
 		return true;
 	obs_source_t *src = obs_sceneitem_get_source(item);
 	if (src)
-		audio_scan_source(scan, src, scan->depth + 1);
+		tap_scan_source(scan, src, scan->depth + 1);
 	return true;
 }
 
-static void audio_scan_source(audio_scan *scan, obs_source_t *src, int depth)
+static void tap_scan_source(tap_scan *scan, obs_source_t *src, int depth)
 {
-	if (depth > 8 || scan->list.size() >= 64)
+	if (depth > 8)
 		return;
 	obs_scene_t *scene = obs_scene_from_source(src);
 	if (!scene)
@@ -1111,80 +1156,117 @@ static void audio_scan_source(audio_scan *scan, obs_source_t *src, int depth)
 	if (scene) {
 		int saved = scan->depth;
 		scan->depth = depth;
-		obs_scene_enum_items(scene, audio_scan_item, scan);
+		obs_scene_enum_items(scene, tap_scan_item, scan);
 		scan->depth = saved;
 		return;
 	}
 	if (!(obs_source_get_output_flags(src) & OBS_SOURCE_AUDIO))
 		return;
-	if (obs_source_audio_pending(src))
-		return;
-	uint64_t ts = obs_source_get_audio_timestamp(src);
-	if (!ts)
-		return;
+	audio_taps *taps = scan->f->taps;
+	for (audio_tap *t : taps->list) {
+		if (t->src == src) {
+			t->seen = true;
+			return;
+		}
+	}
 	obs_source_t *ref = obs_source_get_ref(src);
-	if (ref)
-		scan->list.push_back({ref, ts});
+	if (!ref)
+		return;
+	auto tap = new audio_tap();
+	tap->src = ref;
+	tap->channels = 0;
+	tap->muted = false;
+	tap->seen = true;
+	obs_source_add_audio_capture_callback(ref, tap_capture, tap);
+	taps->list.push_back(tap);
 }
 
-static void ndi_filter_audio_tick(void *data, size_t, struct audio_data *tick)
+// Re-sync the tap list with what is visible in the scene. Called with taps->mutex held.
+static void taps_rescan(ndi_filter_t *f, obs_source_t *parent)
+{
+	audio_taps *taps = f->taps;
+	for (audio_tap *t : taps->list)
+		t->seen = false;
+	tap_scan scan = {f, 0};
+	tap_scan_source(&scan, parent, 0);
+	for (size_t i = 0; i < taps->list.size();) {
+		if (!taps->list[i]->seen) {
+			tap_destroy(taps->list[i]);
+			taps->list.erase(taps->list.begin() + i);
+		} else {
+			i++;
+		}
+	}
+}
+
+static void taps_clear(ndi_filter_t *f)
+{
+	if (!f->taps)
+		return;
+	std::lock_guard<std::mutex> lk(f->taps->mutex);
+	for (audio_tap *t : f->taps->list)
+		tap_destroy(t);
+	f->taps->list.clear();
+}
+
+static void ndi_filter_audio_tick(void *data, size_t, struct audio_data *)
 {
 	auto f = (ndi_filter_t *)data;
-	if (!f->send_audio || !f->ndi_sender || f->is_audioonly)
+	if (f->is_audioonly || !f->taps)
 		return;
+
 	obs_source_t *parent = obs_filter_get_parent(f->obs_source);
-	if (!parent || !obs_source_enabled(f->obs_source))
+	const bool want = f->send_audio && f->ndi_sender && parent && obs_source_enabled(f->obs_source);
+
+	std::lock_guard<std::mutex> lk(f->taps->mutex);
+	if (!want) {
+		if (!f->taps->list.empty()) {
+			for (audio_tap *t : f->taps->list)
+				tap_destroy(t);
+			f->taps->list.clear();
+		}
+		return;
+	}
+
+	const uint64_t now = os_gettime_ns();
+	if (now - f->last_tap_scan_ns >= 500000000ULL) { // every 0.5 s
+		f->last_tap_scan_ns = now;
+		taps_rescan(f, parent);
+	}
+	if (f->taps->list.empty())
 		return;
 
 	obs_audio_info oai;
 	if (!obs_get_audio_info(&oai))
 		return;
 	const size_t channels = get_audio_channels(oai.speakers);
-	const size_t sample_rate = oai.samples_per_sec;
 	if (!channels || channels > MAX_AUDIO_CHANNELS)
 		return;
 
-	audio_scan scan;
-	scan.depth = 0;
-	audio_scan_source(&scan, parent, 0);
-
-	uint64_t base = 0;
-	for (const audio_src &a : scan.list)
-		if (!base || a.ts < base)
-			base = a.ts;
-
+	memset(f->audio_planar, 0, sizeof(float) * channels * AUDIO_OUTPUT_FRAMES);
 	bool any = false;
-	if (base) {
-		memset(f->audio_mix, 0, sizeof(f->audio_mix));
-		obs_source_audio_mix child;
-		for (const audio_src &a : scan.list) {
-			size_t pos = (size_t)((a.ts - base) * sample_rate / 1000000000ULL);
-			if (pos >= AUDIO_OUTPUT_FRAMES)
+	for (audio_tap *t : f->taps->list) {
+		std::lock_guard<std::mutex> tl(t->mutex);
+		const float vol = t->muted ? 0.0f : obs_source_get_volume(t->src);
+		for (size_t ch = 0; ch < channels; ch++) {
+			std::deque<float> &q = t->ring[ch];
+			const size_t n = q.size() < AUDIO_OUTPUT_FRAMES ? q.size() : AUDIO_OUTPUT_FRAMES;
+			if (!n)
 				continue;
-			obs_source_get_audio_mix(a.src, &child);
-			for (size_t ch = 0; ch < channels; ch++) {
-				const float *in = child.output[0].data[ch];
-				if (!in)
-					continue;
-				float *out = f->audio_mix[ch] + pos;
-				for (size_t i = 0; i < AUDIO_OUTPUT_FRAMES - pos; i++)
-					out[i] += in[i];
+			float *out = f->audio_planar + ch * AUDIO_OUTPUT_FRAMES;
+			if (vol > 0.0f) {
+				for (size_t i = 0; i < n; i++)
+					out[i] += q[i] * vol;
+				any = true;
 			}
-			any = true;
+			q.erase(q.begin(), q.begin() + n);
 		}
 	}
-	for (const audio_src &a : scan.list)
-		obs_source_release(a.src);
-	if (!any)
-		return;
-
-	// Pack planar (FLTP) and send.
-	for (size_t ch = 0; ch < channels; ch++)
-		memcpy(f->audio_planar + ch * AUDIO_OUTPUT_FRAMES, f->audio_mix[ch],
-		       AUDIO_OUTPUT_FRAMES * sizeof(float));
+	// Keep the stream continuous: send silence rather than nothing while taps exist.
+	(void)any;
 
 	NDIlib_audio_frame_v3_t frame = {0};
-	frame.sample_rate = (int)sample_rate;
+	frame.sample_rate = (int)oai.samples_per_sec;
 	frame.no_channels = (int)channels;
 	frame.no_samples = AUDIO_OUTPUT_FRAMES;
 	frame.channel_stride_in_bytes = AUDIO_OUTPUT_FRAMES * sizeof(float);
@@ -1192,7 +1274,6 @@ static void ndi_filter_audio_tick(void *data, size_t, struct audio_data *tick)
 	frame.timecode = NDIlib_send_timecode_synthesize;
 	frame.p_data = (uint8_t *)f->audio_planar;
 	frame.p_metadata = nullptr;
-	(void)tick;
 
 	pthread_mutex_lock(&f->ndi_sender_audio_mutex);
 	if (f->ndi_sender)
